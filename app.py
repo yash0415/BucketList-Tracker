@@ -962,13 +962,14 @@ def render_map_page(user_id, selected_section_id=None):
         margin=dict(t=0, b=0, l=0, r=0),
         dragmode="pan",
     )
-    fig.update_config(
-        displayModeBar=True,
-        scrollZoom=True,
-        modeBarButtonsToAdd=["zoomIn2d", "zoomOut2d", "resetScale2d"],
-    )
 
-    st.plotly_chart(fig, use_container_width=True, key="main_map")
+    map_config = {
+        "displayModeBar": True,
+        "scrollZoom": True,
+        "modeBarButtonsToAdd": ["zoomIn2d", "zoomOut2d", "resetScale2d"],
+    }
+
+    st.plotly_chart(fig, use_container_width=True, key="main_map", config=map_config)
 
     st.caption("💡 Tip: Use the mouse wheel or the +/− buttons on the map to zoom in/out. "
                "Click a marker, then use the 'Open in Google Maps' button below.")
