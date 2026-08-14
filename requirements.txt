@@ -1,2 +1,5 @@
 streamlit
 plotly
+pandas
+requests 
+pillow
