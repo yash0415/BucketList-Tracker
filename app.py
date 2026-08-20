@@ -212,10 +212,6 @@ def init_db():
                 _add_column_if_missing(cur, "places", col, coltype)
             conn.commit()
 
-    # subsections: sections can nest under any other section via parent_id
-    _add_column_if_missing(cur, "sections", "parent_id", "INTEGER")
-    conn.commit()
-
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='photos'")
     if not cur.fetchone():
         cur.execute(FINAL_PHOTOS_SCHEMA)
@@ -323,83 +319,24 @@ def small_map(lat, lon, label):
 # ----------------------------------------------------------------------
 # DATA HELPERS
 # ----------------------------------------------------------------------
-def get_all_sections(user_id):
-    """Every section (top-level and sub) for this user, as a flat list."""
+def get_sections(user_id):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id, name, parent_id FROM sections WHERE user_id = ? ORDER BY id", (user_id,))
+    cur.execute("SELECT id, name FROM sections WHERE user_id = ? ORDER BY id", (user_id,))
     rows = cur.fetchall()
     conn.close()
-    return [{"id": r[0], "name": r[1], "parent_id": r[2]} for r in rows]
+    return [{"id": r[0], "name": r[1]} for r in rows]
 
 
-def get_section_tree(user_id, root_id=None):
-    """
-    Returns sections in display order (parent immediately followed by its
-    children, depth-first), each tagged with a 'depth' for indentation.
-    If root_id is given, only that section and its descendants are returned
-    (root_id itself included at depth 0).
-    """
-    all_sections = get_all_sections(user_id)
-    by_parent = {}
-    for s in all_sections:
-        by_parent.setdefault(s["parent_id"], []).append(s)
-
-    def walk(parent_id, depth):
-        items = []
-        for s in sorted(by_parent.get(parent_id, []), key=lambda x: x["id"]):
-            items.append({**s, "depth": depth})
-            items.extend(walk(s["id"], depth + 1))
-        return items
-
-    if root_id is None:
-        return walk(None, 0)
-
-    root = next((s for s in all_sections if s["id"] == root_id), None)
-    if root is None:
-        return []
-    return [{**root, "depth": 0}] + walk(root_id, 1)
-
-
-def section_options(user_id, exclude_id=None):
-    """(label, id) pairs for dropdowns, indented to show hierarchy.
-    exclude_id (and its descendants) can be left out - used so a section
-    can't be made its own parent/grandparent when picking where to nest it."""
-    tree = get_section_tree(user_id)
-    excluded_ids = set()
-    if exclude_id is not None:
-        excluded_ids = {s["id"] for s in get_section_tree(user_id, root_id=exclude_id)}
-    options = []
-    for s in tree:
-        if s["id"] in excluded_ids:
-            continue
-        prefix = "　" * s["depth"] + ("↳ " if s["depth"] > 0 else "📂 ")
-        options.append((prefix + s["name"], s["id"]))
-    return options
-
-
-def add_section(user_id, name, parent_id=None):
+def add_section(user_id, name):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO sections (user_id, name, parent_id) VALUES (?, ?, ?)",
-        (user_id, name, parent_id),
-    )
+    cur.execute("INSERT INTO sections (user_id, name) VALUES (?, ?)", (user_id, name))
     conn.commit()
     conn.close()
 
 
 def delete_section(section_id):
-    """Deletes a section, its subsections (recursively), and their places."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM sections WHERE parent_id = ?", (section_id,))
-    child_ids = [r[0] for r in cur.fetchall()]
-    conn.close()
-
-    for child_id in child_ids:
-        delete_section(child_id)  # recurse into subsections first
-
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM sections WHERE id = ?", (section_id,))
