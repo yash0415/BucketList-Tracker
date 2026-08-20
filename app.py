@@ -595,9 +595,32 @@ def render_sidebar(user_id):
         logout()
         st.rerun()
 
-    st.sidebar.divider()
+    # --- Database connection status check ---
+    with st.sidebar.expander("🔧 Debug: Database Status"):
+        try:
+            dbg_conn = get_conn()
+            dbg_cur = dbg_conn.cursor()
+            dbg_cur.execute("SELECT COUNT(*) FROM users")
+            user_count = dbg_cur.fetchone()[0]
+            dbg_cur.execute("SELECT COUNT(*) FROM sections")
+            section_count = dbg_cur.fetchone()[0]
+            dbg_cur.execute("SELECT COUNT(*) FROM places")
+            place_count = dbg_cur.fetchone()[0]
+            dbg_conn.close()
 
-    # Navigation
+            st.success("✅ Connected to Turso")
+            st.write(f"👤 Users: {user_count}")
+            st.write(f"📂 Sections: {section_count}")
+            st.write(f"📍 Places: {place_count}")
+            db_url = st.secrets.get("TURSO_DATABASE_URL", "NOT SET")
+            st.caption(f"DB URL: {db_url[:35]}...")
+        except Exception as e:
+            st.error("❌ Not connected")
+            st.code(str(e))
+            st.caption("Common causes: wrong/missing TURSO_DATABASE_URL or "
+                       "TURSO_AUTH_TOKEN in Secrets, or a typo in either value.")
+
+    st.sidebar.divider()
     st.sidebar.subheader("🧭 Navigate")
     pages = ["Dashboard", "My List", "Add Places", "Map"]
     selected_page = st.sidebar.radio("Page:", pages, index=pages.index(st.session_state.current_page))
