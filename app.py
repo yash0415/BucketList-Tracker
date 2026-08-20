@@ -2,12 +2,18 @@
 Bucket List Tracker
 ------------------
 Run with:
-    pip install streamlit plotly pandas requests pillow
+    pip install streamlit plotly pandas requests pillow folium streamlit-folium libsql
     streamlit run app.py
+
+DATABASE:
+This app stores data on Turso (a free, hosted SQLite-compatible database)
+instead of a local file, because Streamlit Community Cloud wipes local
+files whenever the app restarts/redeploys/sleeps. See the setup notes
+in get_conn() below.
 """
 
 import streamlit as st
-import sqlite3
+import libsql
 import hashlib
 import hmac
 import os
@@ -17,6 +23,8 @@ import requests
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import folium
+from streamlit_folium import st_folium
 from io import BytesIO
 from PIL import Image
 
@@ -25,7 +33,6 @@ from PIL import Image
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="My Bucket List Tracker", page_icon="🌍", layout="wide")
 
-DB_FILE = "bucket_list.db"
 COLOR_VISITED = "#2ecc71"
 COLOR_REMAINING = "#e74c3c"
 DEFAULT_SECTIONS = ["Temples", "Hill Stations", "Beaches"]
@@ -33,11 +40,39 @@ PRIORITY_OPTIONS = ["🔥 High", "⭐ Medium", "🌙 Someday"]
 
 # ----------------------------------------------------------------------
 # DATABASE SETUP + MIGRATIONS
+#
+# SETUP (one-time):
+#   1. Sign up free at https://turso.tech and install the CLI, or use the
+#      web dashboard directly.
+#   2. Create a database:  turso db create bucket-list
+#   3. Get the URL:        turso db show bucket-list --url
+#   4. Get a token:        turso db tokens create bucket-list
+#   5. In Streamlit Cloud: go to your app -> Settings -> Secrets, and add:
+#         TURSO_DATABASE_URL = "libsql://bucket-list-yourname.turso.io"
+#         TURSO_AUTH_TOKEN = "your-token-here"
+#      For local development, put the same two lines in a
+#      .streamlit/secrets.toml file (add it to .gitignore - don't commit it).
 # ----------------------------------------------------------------------
 def get_conn():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = libsql.connect(
+        database=st.secrets["TURSO_DATABASE_URL"],
+        auth_token=st.secrets["TURSO_AUTH_TOKEN"],
+    )
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+    except Exception:
+        pass  # some remote libSQL setups manage this server-side instead
     return conn
+
+
+def _lastrowid(cur, conn):
+    """Get the id of the last inserted row, with a safe fallback for
+    remote libSQL connections where .lastrowid isn't always populated."""
+    rid = getattr(cur, "lastrowid", None)
+    if rid:
+        return rid
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
+    return row[0] if row else None
 
 
 def _table_columns(cur, table):
@@ -217,7 +252,7 @@ def register_user(username: str, password: str):
         "INSERT INTO users (username, salt, password_hash) VALUES (?, ?, ?)",
         (username, salt_hex, hash_hex),
     )
-    user_id = cur.lastrowid
+    user_id = _lastrowid(cur, conn)
     for section in DEFAULT_SECTIONS:
         cur.execute("INSERT INTO sections (user_id, name) VALUES (?, ?)", (user_id, section))
     conn.commit()
@@ -240,59 +275,35 @@ def login_user(username: str, password: str):
 
 
 # ----------------------------------------------------------------------
-# GEOCODING (fuzzy, multiple fallback queries)
+# GEOCODING
+# Kept to ONE primary request + one fallback, spaced out, to respect
+# Nominatim's 1-request/second usage policy. Firing 5 rapid queries per
+# place (as before) risks silent rate-limiting, which returns no results
+# and can look like "the map isn't showing anything".
 # ----------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def geocode(place_name: str):
     import time
 
-    base_headers = {"User-Agent": "BucketListTrackerApp/1.0"}
-    base_params = {
-        "format": "json",
-        "limit": 3,
-        "addressdetails": 1,
-    }
+    headers = {"User-Agent": "BucketListTrackerApp/1.0 (contact: example@example.com)"}
+    params_base = {"format": "json", "limit": 1}
 
-    queries = [
-        place_name.strip(),
-        f"{place_name.strip()}, India",
-        f"{place_name.strip()} temple",
-        f"{place_name.strip()} beach",
-        f"{place_name.strip()} hill station",
-    ]
-
-    best = None
-    best_score = 0.0
-
-    for q in queries:
+    for attempt, query in enumerate([place_name.strip(), f"{place_name.strip()}, India"]):
         try:
-            params = {**base_params, "q": q}
             resp = requests.get(
                 "https://nominatim.openstreetmap.org/search",
-                params=params,
-                headers=base_headers,
+                params={**params_base, "q": query},
+                headers=headers,
                 timeout=8,
             )
             results = resp.json()
-            time.sleep(0.2)
-
-            for r in results:
-                score = float(r.get("importance", 0.5))
-                place_type = (r.get("type") or "").lower()
-                if "temple" in place_type or "shrine" in place_type:
-                    score += 0.1
-                if "beach" in place_type or "coast" in place_type:
-                    score += 0.1
-                if "hill" in place_type or "peak" in place_type:
-                    score += 0.1
-
-                if score > best_score:
-                    best_score = score
-                    best = (float(r["lat"]), float(r["lon"]))
+            if results:
+                return float(results[0]["lat"]), float(results[0]["lon"])
         except Exception:
-            continue
+            pass
+        time.sleep(1.1)  # respect Nominatim's rate limit before any retry
 
-    return best if best is not None else (None, None)
+    return None, None
 
 
 def small_map(lat, lon, label):
@@ -364,7 +375,7 @@ def insert_place(section_id, name, visited=False, lat=None, lon=None, notes="", 
         (section_id, name, int(visited), lat, lon, notes, priority, visited_date, description),
     )
     conn.commit()
-    new_id = cur.lastrowid
+    new_id = _lastrowid(cur, conn)
     conn.close()
     return new_id
 
@@ -913,7 +924,8 @@ def render_add_places_page(user_id, selected_section_id=None):
 
 
 # ----------------------------------------------------------------------
-# MAP PAGE (interactive, clickable to Google Maps)
+# MAP PAGE — Folium: native zoom controls + clickable "Get Directions"
+# popup that opens Google Maps directions in a new tab.
 # ----------------------------------------------------------------------
 def render_map_page(user_id, selected_section_id=None):
     st.subheader("🗺️ Your places on the map")
@@ -947,45 +959,36 @@ def render_map_page(user_id, selected_section_id=None):
         st.info("Nothing to show for this filter.")
         return
 
-    fig = px.scatter_mapbox(
-        df, lat="lat", lon="lon", color="Status",
-        color_discrete_map={"Visited": COLOR_VISITED, "Remaining": COLOR_REMAINING},
-        hover_name="Place",
-        hover_data={"Section": True, "Priority": True, "lat": False, "lon": False, "Status": False},
-        zoom=1, height=550,
-    )
+    center_lat = df["lat"].mean()
+    center_lon = df["lon"].mean()
+    fmap = folium.Map(location=[center_lat, center_lon], zoom_start=4,
+                       control_scale=True, tiles="OpenStreetMap")
 
-    # Enable zoom/pan modebar and make markers clickable via customdata + JS is not directly possible,
-    # so we add an info box below: when user selects a place from dropdown, open Google Maps.
-    fig.update_layout(
-        mapbox_style="open-street-map",
-        margin=dict(t=0, b=0, l=0, r=0),
-        dragmode="pan",
-    )
+    for _, row in df.iterrows():
+        color = "green" if row["Status"] == "Visited" else "red"
+        gmaps_url = f"https://www.google.com/maps/dir/?api=1&destination={row['lat']},{row['lon']}"
+        popup_html = f"""
+            <div style="font-family: sans-serif; font-size: 14px; min-width: 160px;">
+                <b>{row['Place']}</b><br>
+                {row['Section']} &middot; {row['Priority']}<br>
+                <a href="{gmaps_url}" target="_blank" rel="noopener noreferrer">
+                    📍 Get Directions
+                </a>
+            </div>
+        """
+        folium.Marker(
+            location=[row["lat"], row["lon"]],
+            tooltip=row["Place"],
+            popup=folium.Popup(popup_html, max_width=250),
+            icon=folium.Icon(color=color, icon="flag"),
+        ).add_to(fmap)
 
-    map_config = {
-        "displayModeBar": True,
-        "scrollZoom": True,
-        "modeBarButtonsToAdd": ["zoomIn2d", "zoomOut2d", "resetScale2d"],
-    }
+    # returned_objects=[] avoids Streamlit re-running the whole app on every
+    # hover/pan — only the map itself updates.
+    st_folium(fmap, use_container_width=True, height=550, returned_objects=[])
 
-    st.plotly_chart(fig, use_container_width=True, key="main_map", config=map_config)
-
-    st.caption("💡 Tip: Use the mouse wheel or the +/− buttons on the map to zoom in/out. "
-               "Click a marker, then use the 'Open in Google Maps' button below.")
-
-    # Simple place selector for Google Maps redirect
-    place_options = [f"{r['Place']} ({r['Section']})" for _, r in df.iterrows()]
-    selected_place_label = st.selectbox("Select a place to open in Google Maps:", place_options)
-
-    if selected_place_label:
-        selected_row = df[df["Place"] + " (" + df["Section"] + ")" == selected_place_label].iloc[0]
-        lat = selected_row["lat"]
-        lon = selected_row["lon"]
-        if st.button("🧭 Open in Google Maps"):
-            url = f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}"
-            st.markdown(f"[Open directions in Google Maps]({url})", unsafe_allow_html=True)
-            st.info("If the link doesn't open automatically, click it above.")
+    st.caption("💡 Use the **+ / −** buttons (top-left of the map) or scroll to zoom. "
+               "Click a marker, then tap **'Get Directions'** in its popup to open Google Maps.")
 
     missing = sum(1 for s in sections for p in get_places(s["id"]) if p["lat"] is None or p["lon"] is None)
     if missing:
